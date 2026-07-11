@@ -9,6 +9,17 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+# Matches the whitespace between two sentences (letter, then ./!/?, then a
+# space) without matching after list markers like "1." or "2.".
+SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[a-zA-Z][.!?])\s+')
+# Matches a bullet ("-", "*") or numbered ("1.") list marker at line start.
+LIST_ITEM_RE = re.compile(r'^(-|\*|\d+\.)\s')
+# Lowercase alphanumeric runs. Splits on punctuation AND separators like
+# "_"/"."/"/" so compound identifiers (e.g. `auth_utils.py`) decompose into
+# their meaningful parts ("auth", "utils", "py") instead of staying one token.
+WORD_RE = re.compile(r'[a-z0-9]+')
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -32,17 +43,47 @@ class DocuBot:
     def load_documents(self):
         """
         Loads all .md and .txt files inside docs_folder.
+        Each file is split into paragraphs, then further into smaller
+        sections (individual list items, individual sentences) so
+        retrieval can pinpoint narrower spans of text.
         Returns a list of tuples: (filename, text)
         """
         docs = []
-        pattern = os.path.join(self.docs_folder, "*.*")
+        base = os.path.dirname(os.path.abspath(__file__))
+        pattern = os.path.join(base, self.docs_folder, "*.*")
         for path in glob.glob(pattern):
             if path.endswith(".md") or path.endswith(".txt"):
                 with open(path, "r", encoding="utf8") as f:
                     text = f.read()
                 filename = os.path.basename(path)
-                docs.append((filename, text))
+                for paragraph in text.split("\n\n"):
+                    paragraph = paragraph.strip()
+                    if not paragraph:
+                        continue
+                    for section in self._split_into_sections(paragraph):
+                        docs.append((filename, section))
         return docs
+
+    def _split_into_sections(self, paragraph):
+        """
+        Break a paragraph into smaller sections: individual items when it's
+        a flat bullet/numbered list, then individual sentences within each
+        resulting unit. Fenced code blocks are kept intact since splitting
+        them line by line would break their meaning.
+        """
+        if paragraph.startswith("```"):
+            return [paragraph]
+
+        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        if len(lines) > 1 and all(LIST_ITEM_RE.match(line) for line in lines):
+            units = lines
+        else:
+            units = [paragraph]
+
+        sections = []
+        for unit in units:
+            sections.extend(s.strip() for s in SENTENCE_BOUNDARY_RE.split(unit) if s.strip())
+        return sections or [paragraph]
 
     # -----------------------------------------------------------
     # Index Construction (Phase 1)
@@ -50,50 +91,90 @@ class DocuBot:
 
     def build_index(self, documents):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
-
-        Example structure:
-        {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
-        }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        Build an inverted index mapping each meaningful lowercase word to the
+        positions (indices into `documents`) of the chunks that contain it as
+        a whole word. Used by retrieve() to narrow down candidate chunks
+        before scoring.
         """
         index = {}
-        # TODO: implement simple indexing
+        for i, (_, text) in enumerate(documents):
+            for word in self._meaningful_words(text):
+                index.setdefault(word, set()).add(i)
         return index
 
     # -----------------------------------------------------------
     # Scoring and Retrieval (Phase 1)
     # -----------------------------------------------------------
 
+    STOP_WORDS = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "to", "of", "in", "on",
+        "at", "for", "with", "by", "from", "and", "or", "but", "not", "it",
+        "its", "this", "that", "these", "those", "what", "which", "who",
+        "how", "when", "where", "why", "there", "their", "they", "them",
+        "like", "just", "about", "any", "i", "my", "we", "our", "you",
+        "your", "he", "she", "his", "her", "today", "s"
+    }
+
+    def _meaningful_words(self, text):
+        """
+        Extract the lowercase words that matter for scoring/indexing:
+        alphanumeric runs (so compound identifiers like `auth_utils.py`
+        decompose into "auth", "utils", "py"), with stop words filtered out.
+        """
+        words = WORD_RE.findall(text.lower())
+        return [w for w in words if w not in self.STOP_WORDS]
+
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Return a simple relevance score for how well the text matches the query:
+        the number of distinct meaningful query words that appear as whole
+        words in the text (not merely as substrings of longer words).
         """
-        # TODO: implement scoring
-        return 0
+        meaningful = self._meaningful_words(query)
+        if not meaningful:
+            return 0
+        text_words = set(self._meaningful_words(text))
+        return sum(1 for word in meaningful if word in text_words)
 
-    def retrieve(self, query, top_k=3):
+    def retrieve(self, query, top_k=3, min_score=1):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
+        Use the index to find candidate chunks that share at least one
+        meaningful word with the query, score just those candidates, and
+        return the top_k highest scoring (filename, text) snippets.
+        """
+        meaningful = self._meaningful_words(query)
+        if not meaningful:
+            return []
 
-        Return a list of (filename, text) sorted by score descending.
+        candidate_positions = set()
+        for word in meaningful:
+            candidate_positions.update(self.index.get(word, ()))
+
+        scored = []
+        for i in sorted(candidate_positions):
+            filename, text = self.documents[i]
+            score = self.score_document(query, text)
+            if score >= min_score:
+                scored.append((score, filename, text))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [(filename, text) for _, filename, text in scored[:top_k]]
+
+    def has_sufficient_evidence(self, query, snippets):
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        Guardrail: require the best-matching snippet to cover at least half
+        of the query's meaningful words (rounded up), so a single incidental
+        keyword overlap isn't treated as enough evidence to answer.
+        """
+        if not snippets:
+            return False
+        meaningful = self._meaningful_words(query)
+        if not meaningful:
+            return False
+        best_score = max(self.score_document(query, text) for _, text in snippets)
+        required = max(1, (len(meaningful) + 1) // 2)
+        return best_score >= required
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -106,7 +187,7 @@ class DocuBot:
         """
         snippets = self.retrieve(query, top_k=top_k)
 
-        if not snippets:
+        if not self.has_sufficient_evidence(query, snippets):
             return "I do not know based on these docs."
 
         formatted = []
@@ -128,8 +209,12 @@ class DocuBot:
 
         snippets = self.retrieve(query, top_k=top_k)
 
-        if not snippets:
+        if not self.has_sufficient_evidence(query, snippets):
             return "I do not know based on these docs."
+
+        print("\n[DEBUG] Snippets retrieved for RAG:")
+        for fname, chunk in snippets:
+            print(f"  [{fname}] {chunk[:120]}")
 
         return self.llm_client.answer_from_snippets(query, snippets)
 

@@ -17,7 +17,7 @@ import google.generativeai as genai
 
 # Central place to update the model name if needed.
 # You can swap this for a different Gemini model in the future.
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
+GEMINI_MODEL_NAME = "gemini-flash-latest"
 
 
 class GeminiClient:
@@ -47,11 +47,15 @@ class GeminiClient:
     # -----------------------------------------------------------
 
     def naive_answer_over_full_docs(self, query, all_text):
-        # We ignore all_text and send a generic prompt instead
         prompt = f"""
-    You are a documentation assistant. 
-    Answer this developer question: {query}
-    """
+You are a documentation assistant.
+Use the following documentation to answer the developer question.
+
+Documentation:
+{all_text}
+
+Question: {query}
+"""
         response = self.model.generate_content(prompt)
         return (response.text or "").strip()
 
